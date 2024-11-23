@@ -1,18 +1,26 @@
 import math
 import os
 import datetime
+import shutil
 from colorama import init, Fore, Style
 from collections import defaultdict
 import mimetypes
 import threading
 import fnmatch
 import json
+import re
 
 # Initialize colorama for cross-platform color support
 init()
 
 class DirectoryAnalyzer:
     def __init__(self, exclude_patterns=None, exclude_file=None):
+        # Get terminal width for dynamic column sizing
+        self.term_width = shutil.get_terminal_size().columns
+        self.metadata_width = 70  # Fixed width for metadata section
+        self.tree_indent = 4      # Space per level of indentation
+        self.min_tree_width = 30  # Minimum width for tree section
+        
         self.total_size = 0
         self.file_types = defaultdict(int)
         self.file_counts = defaultdict(int)
@@ -27,7 +35,6 @@ class DirectoryAnalyzer:
             'custom': set()
         }
         
-        # Add user-provided patterns
         if exclude_patterns:
             for pattern in exclude_patterns:
                 if pattern.endswith('/'):
@@ -35,9 +42,8 @@ class DirectoryAnalyzer:
                 else:
                     self.exclude_patterns['files'].add(pattern)
         
-        # Load patterns from exclude file if provided
         if exclude_file:
-            self.load_exclude_patterns(exclude_file)
+            self.load_exclude_patterns(exclude_file)            
 
     def load_exclude_patterns(self, exclude_file):
         """Load exclude patterns from a JSON file"""
@@ -219,85 +225,146 @@ class DirectoryAnalyzer:
             except KeyError:
                 return f"{stats.st_uid}:{stats.st_gid}"
 
+    def get_visible_length(self, s):
+        """Calculate the visible length of a string, excluding ANSI escape codes"""
+        # Remove all ANSI escape sequences
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return len(ansi_escape.sub('', s))
+    
+    def calculate_layout(self, start_path):
+        """Calculate optimal column widths based on content"""
+        max_name_length = 0
+        
+        def scan_directory(path, level=0):
+            nonlocal max_name_length
+            try:
+                items = [item for item in os.listdir(path) 
+                        if not self.should_exclude(path, item)]
+                
+                for item in items:
+                    full_path = os.path.join(path, item)
+                    # Calculate visible length including tree symbols
+                    tree_prefix_len = level * 4 + 4  # "│   " or "└── " length
+                    name_length = len(item) + tree_prefix_len
+                    max_name_length = max(max_name_length, name_length)
+                    
+                    if os.path.isdir(full_path) and not os.path.islink(full_path):
+                        scan_directory(full_path, level + 1)
+            except (PermissionError, OSError):
+                pass
+
+        scan_directory(start_path)
+        
+        # Add some padding to the tree width
+        self.tree_width = max_name_length + 5
+        
+        # Ensure we don't exceed terminal width
+        available_width = self.term_width - self.min_metadata_width
+        self.tree_width = min(self.tree_width, available_width)
+
+    def format_tree_part(self, prefix, connector, name_part):
+        """Format the tree part of the line with appropriate padding"""
+        tree_part = f"{prefix}{connector} {name_part}"
+        visible_length = self.get_visible_length(tree_part)
+        
+        # Calculate space needed before metadata
+        metadata_position = self.term_width - self.metadata_width
+        
+        # Ensure minimum tree width
+        if visible_length < self.min_tree_width:
+            padding = self.min_tree_width - visible_length
+            tree_part += " " * padding
+            visible_length = self.min_tree_width
+        
+        # Add padding to align metadata
+        if visible_length < metadata_position:
+            tree_part += " " * (metadata_position - visible_length)
+        
+        return tree_part
+
+    def format_metadata(self, stats, full_path, is_dir, item_count=None):
+        """Format metadata string"""
+        modified_time = datetime.datetime.fromtimestamp(stats.st_mtime)
+        perms = self.get_permissions(stats)
+        owner_info = self.get_owner_info(stats) or "n/a"
+        
+        if is_dir:
+            size_str = self.convert_size(self.get_dir_size_fast(full_path))
+            type_str = f"{Fore.CYAN}DIR {Style.RESET_ALL}"
+            modified_str = f"{modified_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            #if item_count is not None:
+            #    modified_str += f" ({item_count} items)"
+        else:
+            size_str = self.convert_size(stats.st_size)
+            type_str = f"{Fore.GREEN}FILE{Style.RESET_ALL}"
+            modified_str = modified_time.strftime('%Y-%m-%d %H:%M:%S')
+        
+        return f"{type_str:<6} {size_str:>10} {perms:<10} {owner_info:<20} {modified_str}"
+    
     def print_tree(self, start_path, prefix="", level=0, max_level=None):
-        """Print directory tree with enhanced information"""
+        """Print directory tree with right-aligned metadata"""
         if max_level is not None and level > max_level:
             return
-
+        
         try:
             items = sorted(os.listdir(start_path))
         except PermissionError:
             print(f"{Fore.RED}Permission denied: {start_path}{Style.RESET_ALL}")
             return
-
-        # Filter out excluded items
+        
         items = [item for item in items if not self.should_exclude(start_path, item)]
-
+        
         for idx, item in enumerate(items):
             is_last_item = idx == len(items) - 1
             full_path = os.path.join(start_path, item)
             connector = "└──" if is_last_item else "├──"
-
+            
             try:
                 is_symlink = os.path.islink(full_path)
                 if is_symlink:
                     link_target = os.path.realpath(full_path)
                     if not os.path.exists(link_target):
-                        print(f"{prefix}{connector} {Fore.RED}{item} -> {os.readlink(full_path)} (broken link){Style.RESET_ALL}")
+                        link_str = f"{prefix}{connector} {Fore.RED}{item} -> {os.readlink(full_path)} (broken link){Style.RESET_ALL}"
+                        print(link_str)
                         continue
                     
                 stats = os.stat(full_path)
-                modified_time = datetime.datetime.fromtimestamp(stats.st_mtime)
-                perms = self.get_permissions(stats)
-                owner_info = self.get_owner_info(stats)
                 
+                # Format the tree part
                 if os.path.isdir(full_path):
-                    dir_size = self.get_dir_size_fast(full_path)
-                    
                     with self.lock:
                         self.file_counts['directories'] += 1
                     
                     if is_symlink:
-                        print(f"{prefix}{connector} {Fore.CYAN}{item}/ -> {os.readlink(full_path)}{Style.RESET_ALL}")
+                        name_part = f"{Fore.CYAN}{item}/ -> {os.readlink(full_path)}{Style.RESET_ALL}"
                     else:
-                        print(f"{prefix}{connector} {Fore.BLUE}{item}/{Style.RESET_ALL}")
+                        name_part = f"{Fore.BLUE}{item}/{Style.RESET_ALL}"
                     
-                    info = f"{Fore.CYAN}[DIR]{Style.RESET_ALL} {self.convert_size(dir_size)}, "
-                    # Only add permissions/owner if available
-                    perms = self.get_permissions(stats)
-                    if perms:
-                        info += f"Perms: {perms}, "
-                    
-                    owner_info = self.get_owner_info(stats)
-                    if owner_info:
-                        info += f"Owner: {owner_info}, "
-                    
-                    info += f"{len([f for f in os.listdir(full_path) if not self.should_exclude(full_path, f)])} items, "
-                    info += f"Modified: {modified_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                    print(f"{prefix}{'    ' if is_last_item else '│   '} {info}")
-                    
-                    if not is_symlink:  # Don't recurse into symlinked directories to prevent loops
-                        extension = "    " if is_last_item else "│   "
-                        self.print_tree(full_path, prefix + extension, level + 1, max_level)
+                    #item_count = len([f for f in os.listdir(full_path) if not self.should_exclude(full_path, f)])
+                    metadata = self.format_metadata(stats, full_path, True, None)
                 else:
                     color = self.get_color_for_file(item)
                     if is_symlink:
-                        print(f"{prefix}{connector} {color}{item} -> {os.readlink(full_path)}{Style.RESET_ALL}")
+                        name_part = f"{color}{item} -> {os.readlink(full_path)}{Style.RESET_ALL}"
                     else:
-                        print(f"{prefix}{connector} {color}{item}{Style.RESET_ALL}")
+                        name_part = f"{color}{item}{Style.RESET_ALL}"
                     
-                    info = f"{Fore.GREEN}[FILE]{Style.RESET_ALL} {self.convert_size(stats.st_size)}, "
-                    info += f"Perms: {perms}, "
-                    if owner_info:
-                        info += f"Owner: {owner_info}, "
-                    info += f"Modified: {modified_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                    print(f"{prefix}{'    ' if is_last_item else '│   '} {info}")
-
-                    # Process file statistics asynchronously
+                    metadata = self.format_metadata(stats, full_path, False)
+                
+                # Format the complete line with proper alignment
+                tree_part = self.format_tree_part(prefix, connector, name_part)
+                print(f"{tree_part}{metadata}")
+                
+                if os.path.isdir(full_path) and not is_symlink:
+                    extension = "    " if is_last_item else "│   "
+                    self.print_tree(full_path, prefix + extension, level + 1, max_level)
+                
+                if not os.path.isdir(full_path):
                     self.process_file(full_path)
-
+                    
             except (OSError, IOError) as e:
-                print(f"{prefix}{connector} {Fore.RED}{item} (Error: {str(e)}){Style.RESET_ALL}")
+                error_msg = f"{prefix}{connector} {Fore.RED}{item} (Error: {str(e)}){Style.RESET_ALL}"
+                print(error_msg)
 
     def print_summary(self):
         """Print summary statistics"""
@@ -330,7 +397,7 @@ class DirectoryAnalyzer:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Enhanced directory tree analyzer')
+    parser = argparse.ArgumentParser(description='Enhanced directory tree analyzer with aligned output')
     parser.add_argument('path', nargs='?', default='.', help='Starting directory path')
     parser.add_argument('--max-level', type=int, help='Maximum depth to traverse')
     parser.add_argument('--no-color', action='store_true', help='Disable color output')
@@ -353,4 +420,4 @@ def main():
         analyzer.print_summary()
 
 if __name__ == "__main__":
-        main()
+    main()
