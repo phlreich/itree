@@ -6,7 +6,6 @@ from collections import defaultdict
 import mimetypes
 import threading
 import fnmatch
-from pathlib import Path
 import json
 
 # Initialize colorama for cross-platform color support
