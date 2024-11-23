@@ -23,7 +23,7 @@ class DirectoryAnalyzer:
         
         # Load default exclude patterns
         self.exclude_patterns = {
-            'dirs': set(['.git', '.svn', '__pycache__', 'node_modules', 'venv', '.env']),
+            'dirs': set(['.git', '.svn', '__pycache__', 'node_modules', 'venv', '.venv','.env']),
             'files': set(['*.pyc', '*.pyo', '*.pyd', '.DS_Store', 'Thumbs.db']),
             'custom': set()
         }
