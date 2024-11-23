@@ -94,10 +94,48 @@ class DirectoryAnalyzer:
         """Get the MIME type of a file"""
         return mimetypes.guess_type(filepath)[0] or "application/octet-stream"
 
+    def get_permissions(self, stats):
+        """Convert file stats to cross-platform permission string"""
+        if os.name == 'nt':  # Windows
+            import stat
+            mode = stats.st_mode
+            attrs = []
+            if mode & stat.S_IRUSR: attrs.append("R")
+            if mode & stat.S_IWUSR: attrs.append("W")
+            if mode & stat.S_IXUSR: attrs.append("X")
+            if stat.S_ISDIR(mode): attrs.append("D")
+            if hasattr(stat, 'S_ISVTX') and mode & stat.S_ISVTX: attrs.append("H")  # Hidden
+            return "[" + "".join(attrs) + "]"
+        else:  # Unix-like
+            perms = stats.st_mode
+            result = ""
+            result += "r" if perms & 0o400 else "-"
+            result += "w" if perms & 0o200 else "-"
+            result += "x" if perms & 0o100 else "-"
+            result += "r" if perms & 0o040 else "-"
+            result += "w" if perms & 0o020 else "-"
+            result += "x" if perms & 0o010 else "-"
+            result += "r" if perms & 0o004 else "-"
+            result += "w" if perms & 0o002 else "-"
+            result += "x" if perms & 0o001 else "-"
+            return result
+
     def process_file(self, filepath):
         """Process a single file for statistics"""
         try:
-            stats = os.stat(filepath)
+            # Handle symlinks
+            if os.path.islink(filepath):
+                link_target = os.path.realpath(filepath)
+                if os.path.exists(link_target):
+                    stats = os.stat(link_target)
+                    is_link = True
+                else:
+                    # Broken symlink
+                    return 0, "broken-link"
+            else:
+                stats = os.stat(filepath)
+                is_link = False
+                
             size = stats.st_size
             modified_time = datetime.datetime.fromtimestamp(stats.st_mtime)
             file_type = self.get_mime_type(filepath)
@@ -106,6 +144,8 @@ class DirectoryAnalyzer:
                 self.total_size += size
                 self.file_types[file_type] += 1
                 self.file_counts['files'] += 1
+                if is_link:
+                    self.file_counts['symlinks'] = self.file_counts.get('symlinks', 0) + 1
                 
                 # Track largest files
                 self.largest_files.append((filepath, size))
@@ -131,9 +171,9 @@ class DirectoryAnalyzer:
                     if self.should_exclude(path, entry.name):
                         continue
                     try:
-                        if entry.is_file():
+                        if entry.is_file(follow_symlinks=False):
                             total += entry.stat().st_size
-                        elif entry.is_dir():
+                        elif entry.is_dir(follow_symlinks=False):
                             total += self.get_dir_size_fast(entry.path)
                     except (OSError, IOError):
                         continue
@@ -153,6 +193,32 @@ class DirectoryAnalyzer:
             return Fore.CYAN
         else:
             return Fore.GREEN
+
+    def get_owner_info(self, stats):
+        """Get owner and group information in a cross-platform way"""
+        if os.name == 'nt':  # Windows
+            try:
+                import win32security
+                owner_sid = win32security.GetFileSecurity(
+                    filepath, win32security.OWNER_SECURITY_INFORMATION
+                ).GetSecurityDescriptorOwner()
+                name, domain, type = win32security.LookupAccountSid(None, owner_sid)
+                return f"{domain}\\{name}"
+            except ImportError:
+                return None  # win32security not available
+            except Exception:
+                return None
+        else:  # Unix-like
+            try:
+                import pwd
+                import grp
+                owner = pwd.getpwuid(stats.st_uid).pw_name
+                group = grp.getgrgid(stats.st_gid).gr_name
+                return f"{owner}:{group}"
+            except ImportError:
+                return None
+            except KeyError:
+                return f"{stats.st_uid}:{stats.st_gid}"
 
     def print_tree(self, start_path, prefix="", level=0, max_level=None):
         """Print directory tree with enhanced information"""
@@ -174,8 +240,17 @@ class DirectoryAnalyzer:
             connector = "└──" if is_last_item else "├──"
 
             try:
+                is_symlink = os.path.islink(full_path)
+                if is_symlink:
+                    link_target = os.path.realpath(full_path)
+                    if not os.path.exists(link_target):
+                        print(f"{prefix}{connector} {Fore.RED}{item} -> {os.readlink(full_path)} (broken link){Style.RESET_ALL}")
+                        continue
+                    
                 stats = os.stat(full_path)
                 modified_time = datetime.datetime.fromtimestamp(stats.st_mtime)
+                perms = self.get_permissions(stats)
+                owner_info = self.get_owner_info(stats)
                 
                 if os.path.isdir(full_path):
                     dir_size = self.get_dir_size_fast(full_path)
@@ -183,20 +258,39 @@ class DirectoryAnalyzer:
                     with self.lock:
                         self.file_counts['directories'] += 1
                     
-                    print(f"{prefix}{connector} {Fore.BLUE}{item}/{Style.RESET_ALL}")
+                    if is_symlink:
+                        print(f"{prefix}{connector} {Fore.CYAN}{item}/ -> {os.readlink(full_path)}{Style.RESET_ALL}")
+                    else:
+                        print(f"{prefix}{connector} {Fore.BLUE}{item}/{Style.RESET_ALL}")
+                    
                     info = f"{Fore.CYAN}[DIR]{Style.RESET_ALL} {self.convert_size(dir_size)}, "
+                    # Only add permissions/owner if available
+                    perms = self.get_permissions(stats)
+                    if perms:
+                        info += f"Perms: {perms}, "
+                    
+                    owner_info = self.get_owner_info(stats)
+                    if owner_info:
+                        info += f"Owner: {owner_info}, "
+                    
                     info += f"{len([f for f in os.listdir(full_path) if not self.should_exclude(full_path, f)])} items, "
                     info += f"Modified: {modified_time.strftime('%Y-%m-%d %H:%M:%S')}"
                     print(f"{prefix}{'    ' if is_last_item else '│   '} {info}")
                     
-                    extension = "    " if is_last_item else "│   "
-                    self.print_tree(full_path, prefix + extension, level + 1, max_level)
+                    if not is_symlink:  # Don't recurse into symlinked directories to prevent loops
+                        extension = "    " if is_last_item else "│   "
+                        self.print_tree(full_path, prefix + extension, level + 1, max_level)
                 else:
-                    size = stats.st_size
                     color = self.get_color_for_file(item)
+                    if is_symlink:
+                        print(f"{prefix}{connector} {color}{item} -> {os.readlink(full_path)}{Style.RESET_ALL}")
+                    else:
+                        print(f"{prefix}{connector} {color}{item}{Style.RESET_ALL}")
                     
-                    print(f"{prefix}{connector} {color}{item}{Style.RESET_ALL}")
-                    info = f"{Fore.GREEN}[FILE]{Style.RESET_ALL} {self.convert_size(size)}, "
+                    info = f"{Fore.GREEN}[FILE]{Style.RESET_ALL} {self.convert_size(stats.st_size)}, "
+                    info += f"Perms: {perms}, "
+                    if owner_info:
+                        info += f"Owner: {owner_info}, "
                     info += f"Modified: {modified_time.strftime('%Y-%m-%d %H:%M:%S')}"
                     print(f"{prefix}{'    ' if is_last_item else '│   '} {info}")
 
@@ -213,6 +307,8 @@ class DirectoryAnalyzer:
         print(f"Total Size: {self.convert_size(self.total_size)}")
         print(f"Total Files: {self.file_counts['files']}")
         print(f"Total Directories: {self.file_counts['directories']}")
+        if 'symlinks' in self.file_counts:
+            print(f"Total Symlinks: {self.file_counts['symlinks']}")
 
         print(f"\n{Fore.YELLOW}Largest Files:{Style.RESET_ALL}")
         for filepath, size in self.largest_files:
@@ -242,6 +338,7 @@ def main():
     parser.add_argument('--no-summary', action='store_true', help='Skip summary statistics')
     parser.add_argument('--exclude', '-e', action='append', help='Patterns to exclude (append / for directories)')
     parser.add_argument('--exclude-file', help='JSON file containing exclude patterns')
+    parser.add_argument('--no-perms', action='store_true', help='Skip permission and owner information')
     
     args = parser.parse_args()
     
@@ -257,4 +354,4 @@ def main():
         analyzer.print_summary()
 
 if __name__ == "__main__":
-    main()
+        main()
