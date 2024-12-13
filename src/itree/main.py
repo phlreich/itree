@@ -401,7 +401,7 @@ def main():
     parser.add_argument('path', nargs='?', default='.', help='Starting directory path')
     parser.add_argument('--max-level', type=int, help='Maximum depth to traverse')
     parser.add_argument('--no-color', action='store_true', help='Disable color output')
-    parser.add_argument('--no-summary', action='store_true', help='Skip summary statistics')
+    parser.add_argument('--summary', '-s', action='store_true', help='Print summary statistics')
     parser.add_argument('--exclude', '-e', action='append', help='Patterns to exclude (append / for directories)')
     parser.add_argument('--exclude-file', help='JSON file containing exclude patterns')
     parser.add_argument('--no-perms', action='store_true', help='Skip permission and owner information')
@@ -416,7 +416,7 @@ def main():
     analyzer = DirectoryAnalyzer(args.exclude, args.exclude_file)
     analyzer.print_tree(args.path, max_level=args.max_level)
     
-    if not args.no_summary:
+    if args.summary:
         analyzer.print_summary()
 
 if __name__ == "__main__":
